@@ -15,6 +15,7 @@ import seaborn as sns
 import queue
 from collections import defaultdict
 import statistics
+import os
 
 # ====== Configuration ======
 TEST_CONFIG = {
@@ -24,7 +25,7 @@ TEST_CONFIG = {
         "ramp_up_time": 10
     },
     "rate_limit_test": {
-        "burst_size": 50,
+        "burst_size": 250,
         "burst_interval": 1  # seconds between bursts
     },
     "stability_test": {
@@ -227,23 +228,72 @@ def make_request(target, test_type="General", request_id="", timeout=10):
         }
         
     except requests.exceptions.Timeout:
-        response_time = timeout
+        # Record actual timeout duration, not the timeout limit
+        response_time = time.time() - start_time if 'start_time' in locals() else timeout
         log_result(name, url, test_type, 0, response_time, "timeout", 0, request_id)
         return {'success': False, 'status_code': 0, 'response_time': response_time, 
                 'error_type': 'timeout', 'bytes_received': 0}
         
     except requests.exceptions.ConnectionError:
-        response_time = -1
+        response_time = time.time() - start_time if 'start_time' in locals() else -1
         log_result(name, url, test_type, 0, response_time, "connection_error", 0, request_id)
         return {'success': False, 'status_code': 0, 'response_time': response_time, 
                 'error_type': 'connection_error', 'bytes_received': 0}
         
     except Exception as e:
-        response_time = -1
+        response_time = time.time() - start_time if 'start_time' in locals() else -1
         error_type = f"exception_{type(e).__name__}"
         log_result(name, url, test_type, 0, response_time, error_type, 0, request_id)
         return {'success': False, 'status_code': 0, 'response_time': response_time, 
                 'error_type': error_type, 'bytes_received': 0}
+
+# ====== Safe Statistics Functions ======
+def safe_mean(values):
+    """Calculate mean safely, returning 0 if no values"""
+    valid_values = [v for v in values if v is not None and v >= 0]
+    return statistics.mean(valid_values) if valid_values else 0
+
+def safe_median(values):
+    """Calculate median safely, returning 0 if no values"""
+    valid_values = [v for v in values if v is not None and v >= 0]
+    return statistics.median(valid_values) if valid_values else 0
+
+def safe_quantile(values, q):
+    """Calculate quantile safely, returning 0 if no values"""
+    # Handle empty values
+    if values is None:
+        return 0
+    
+    # Convert to pandas Series if not already
+    if not isinstance(values, pd.Series):
+        values = pd.Series(values)
+    
+    # Check if empty using pandas method
+    if values.empty:
+        return 0
+    
+    try:
+        return values.quantile(q)
+    except:
+        return 0
+
+def calculate_success_rate(test_df, test_type):
+    """Calculate success rate based on test type context"""
+    if len(test_df) == 0:
+        return 0, 0, 0  # success_count, total_count, success_rate
+    
+    total_count = len(test_df)
+    
+    if test_type == "Failure Injection":
+        # For failure injection, success means detecting failures (non-200 responses)
+        success_count = len(test_df[test_df['status_code'] != 200])
+        success_rate = (success_count / total_count) * 100
+    else:
+        # For other tests, success means getting 200 responses
+        success_count = len(test_df[test_df['status_code'] == 200])
+        success_rate = (success_count / total_count) * 100
+    
+    return success_count, total_count, success_rate
 
 # ====== Test Implementations ======
 def load_test(target, config=None):
@@ -292,10 +342,7 @@ def load_test(target, config=None):
         
         if total > 0:
             successful_times = [r['response_time'] for r in results if r['success'] and r['response_time'] > 0]
-            if successful_times:
-                avg_response_time = statistics.mean(successful_times)
-            else:
-                avg_response_time = 0
+            avg_response_time = safe_mean(successful_times)
             
             print(f"   📊 {user_count} users: {successful}/{total} successful ({100*successful/total:.1f}%), "
                   f"avg response: {avg_response_time:.3f}s")
@@ -336,11 +383,11 @@ def failure_injection_test(target, config=None):
             result = make_request(scenario, "Failure Injection", request_id, timeout=5)
             results.append(result)
     
-    # Summary
-    failed_as_expected = sum(1 for r in results if not r['success'])
+    # Summary - count failures as successes for failure injection
+    failures_detected = sum(1 for r in results if not r['success'] or r['status_code'] != 200)
     total = len(results)
-    print(f"   📊 Failure detection: {failed_as_expected}/{total} scenarios failed as expected "
-          f"({100*failed_as_expected/total:.1f}%)")
+    print(f"   📊 Failure detection: {failures_detected}/{total} scenarios failed as expected "
+          f"({100*failures_detected/total:.1f}%)")
 
 def rate_limit_test(target, config=None):
     """Test rate limiting behavior"""
@@ -377,11 +424,16 @@ def rate_limit_test(target, config=None):
     
     # Analyze results
     successful = sum(1 for r in results if r['success'])
-    rate_limited = sum(1 for r in results if r['error_type'] == 'rate_limited')
+    rate_limited = sum(1 for r in results if r['error_type'] == 'rate_limited' or r['status_code'] == 429)
     total = len(results)
     
     print(f"   📊 Results: {successful} successful, {rate_limited} rate-limited, "
           f"{total - successful - rate_limited} other errors")
+    
+    if rate_limited > 0:
+        print(f"   ✅ Rate limiting detected: {rate_limited} requests were rate-limited")
+    else:
+        print(f"   ⚠️ No rate limiting detected - server accepted all {burst_size} rapid requests")
 
 def stability_test(target, config=None):
     """Long-running stability test"""
@@ -413,7 +465,8 @@ def stability_test(target, config=None):
     # Final summary
     successful = sum(1 for r in results if r['success'])
     total = len(results)
-    avg_response_time = statistics.mean([r['response_time'] for r in results if r['response_time'] > 0])
+    successful_times = [r['response_time'] for r in results if r['response_time'] > 0]
+    avg_response_time = safe_mean(successful_times)
     
     print(f"   📊 Final: {successful}/{total} successful ({100*successful/total:.1f}%), "
           f"avg response: {avg_response_time:.3f}s")
@@ -434,14 +487,22 @@ def validate_data():
     if not negative_times.empty:
         print(f"   ⚠️ Found {len(negative_times)} requests with negative response times")
     
+    # Check for potential timeout artifacts (exact timeout values)
+    timeout_artifacts = df[df['response_time'].isin([5.0, 10.0, 15.0, 30.0])]
+    if not timeout_artifacts.empty:
+        print(f"   ⚠️ Found {len(timeout_artifacts)} requests with potential timeout artifacts")
+    
     # Check for outliers
     valid_times = df[df['response_time'] > 0]['response_time']
     if not valid_times.empty:
-        q99 = valid_times.quantile(0.99)
-        q01 = valid_times.quantile(0.01)
-        outliers = valid_times[(valid_times > q99 * 10) | (valid_times < q01 / 10)]
-        if not outliers.empty:
-            print(f"   ⚠️ Found {len(outliers)} potential response time outliers")
+        q99 = safe_quantile(valid_times, 0.99)
+        q01 = safe_quantile(valid_times, 0.01)
+        if q99 > 0 and q01 > 0:
+            # Convert to list for comparison to avoid pandas Series ambiguity
+            valid_times_list = valid_times.tolist()
+            outliers = [t for t in valid_times_list if t > q99 * 10 or t < q01 / 10]
+            if outliers:
+                print(f"   ⚠️ Found {len(outliers)} potential response time outliers")
     
     # Check timestamp sequences
     df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -500,28 +561,28 @@ def generate_enhanced_graphs(db_path=DB_PATH, output_path="enhanced_graphs.png")
     
     # 1. Response Time Over Time (top left)
     ax1 = plt.subplot(3, 3, 1)
-    for test_type in test_types:
-        mask = df_success['test_type'] == test_type
-        if mask.any():
-            ax1.scatter(df_success[mask]['timestamp'], df_success[mask]['response_time'], 
-                       label=test_type, alpha=0.7, c=[color_map[test_type]], marker='o', s=20)
+    if not df_success.empty:
+        for test_type in test_types:
+            mask = df_success['test_type'] == test_type
+            if mask.any():
+                ax1.scatter(df_success[mask]['timestamp'], df_success[mask]['response_time'], 
+                           label=test_type, alpha=0.7, c=[color_map[test_type]], marker='o', s=20)
     
     ax1.set_title('Response Time Over Time')
     ax1.set_ylabel('Response Time (seconds)')
     ax1.tick_params(axis='x', rotation=45)
     ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    if not df_success.empty:
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    else:
+        ax1.text(0.5, 0.5, 'No Successful Responses', ha='center', va='center', transform=ax1.transAxes)
     
     # 2. Success Rate by Test Type (top middle)
     ax2 = plt.subplot(3, 3, 2)
     success_rates = []
     for test_type in test_types:
         test_df = df_results[df_results['test_type'] == test_type]
-        if test_type == "Failure Injection":
-            # For failure injection, success = detecting failures
-            success_rate = (test_df['status_code'] != 200).mean() * 100
-        else:
-            success_rate = (test_df['status_code'] == 200).mean() * 100
+        _, _, success_rate = calculate_success_rate(test_df, test_type)
         success_rates.append(success_rate)
     
     bars = ax2.bar(range(len(test_types)), success_rates, 
@@ -540,7 +601,7 @@ def generate_enhanced_graphs(db_path=DB_PATH, output_path="enhanced_graphs.png")
     
     # 3. Error Type Distribution (top right)
     ax3 = plt.subplot(3, 3, 3)
-    error_counts = df_results['error_type'].value_counts()
+    error_counts = df_results[df_results['error_type'] != '']['error_type'].value_counts()
     if not error_counts.empty:
         wedges, texts, autotexts = ax3.pie(error_counts.values, labels=error_counts.index, 
                                           autopct='%1.1f%%', startangle=90)
@@ -588,6 +649,8 @@ def generate_enhanced_graphs(db_path=DB_PATH, output_path="enhanced_graphs.png")
         ax6.set_ylabel('Density')
         ax6.legend()
         ax6.grid(True, alpha=0.3)
+    else:
+        ax6.text(0.5, 0.5, 'No Response Time Data', ha='center', va='center', transform=ax6.transAxes)
     
     # 7. Throughput Over Time (bottom left)
     ax7 = plt.subplot(3, 3, 7)
@@ -635,16 +698,13 @@ def generate_enhanced_graphs(db_path=DB_PATH, output_path="enhanced_graphs.png")
         success_df = test_df[test_df['response_time'] > 0]
         
         if not success_df.empty:
-            avg_time = success_df['response_time'].mean()
-            p95_time = success_df['response_time'].quantile(0.95)
+            avg_time = safe_mean(success_df['response_time'])
+            p95_time = safe_quantile(success_df['response_time'], 0.95)
         else:
             avg_time = p95_time = 0
         
         total_requests = len(test_df)
-        if test_type == "Failure Injection":
-            success_rate = (test_df['status_code'] != 200).mean() * 100
-        else:
-            success_rate = (test_df['status_code'] == 200).mean() * 100
+        _, _, success_rate = calculate_success_rate(test_df, test_type)
         
         summary_data.append([test_type[:15], total_requests, f"{success_rate:.1f}%", 
                            f"{avg_time:.3f}s", f"{p95_time:.3f}s"])
@@ -691,27 +751,26 @@ def enhanced_summary_analysis(csv_path=CSV_PATH, summary_csv=ENHANCED_SUMMARY_CS
         total_requests = len(test_df)
         successful_requests = len(success_df)
         
-        # Context-aware success rate
+        # Context-aware success rate using the fixed function
+        success_count, _, success_rate = calculate_success_rate(test_df, test_type)
+        
+        # Determine success definition for display
         if test_type == "Failure Injection":
-            success_count = (test_df['status_code'] != 200).sum()
-            success_rate = (success_count / total_requests) * 100 if total_requests > 0 else 0
             success_definition = "Failure Detection Rate"
         else:
-            success_count = successful_requests
-            success_rate = (success_count / total_requests) * 100 if total_requests > 0 else 0
             success_definition = "Success Rate"
         
-        # Response time statistics
+        # Response time statistics - using safe functions
         if not success_df.empty:
             response_times = success_df['response_time']
-            avg_response = response_times.mean()
-            median_response = response_times.median()
-            p90_response = response_times.quantile(0.90)
-            p95_response = response_times.quantile(0.95)
-            p99_response = response_times.quantile(0.99)
+            avg_response = safe_mean(response_times)
+            median_response = safe_median(response_times)
+            p90_response = safe_quantile(response_times, 0.90)
+            p95_response = safe_quantile(response_times, 0.95)
+            p99_response = safe_quantile(response_times, 0.99)
             min_response = response_times.min()
             max_response = response_times.max()
-            std_response = response_times.std()
+            std_response = response_times.std() if len(response_times) > 1 else 0
         else:
             avg_response = median_response = p90_response = p95_response = p99_response = 0
             min_response = max_response = std_response = 0
@@ -779,35 +838,55 @@ def analyze_performance_trends(df_results):
         success_df = test_df[test_df['response_time'] > 0]
         
         if success_df.empty:
+            insights.append(f"{test_type}: No successful responses recorded")
             continue
         
         # Response time analysis
         response_times = success_df['response_time']
-        cv = response_times.std() / response_times.mean() if response_times.mean() > 0 else 0
-        
-        if cv > 1.0:
-            insights.append(f"{test_type}: High response time variability (CV={cv:.2f})")
-        elif cv < 0.2:
-            insights.append(f"{test_type}: Consistent response times (CV={cv:.2f})")
+        mean_time = safe_mean(response_times)
+        if mean_time > 0:
+            cv = response_times.std() / mean_time
+            
+            if cv > 1.0:
+                insights.append(f"{test_type}: High response time variability (CV={cv:.2f})")
+            elif cv < 0.2:
+                insights.append(f"{test_type}: Consistent response times (CV={cv:.2f})")
         
         # Performance degradation check
         if len(success_df) > 10:
-            first_half = success_df.iloc[:len(success_df)//2]['response_time'].mean()
-            second_half = success_df.iloc[len(success_df)//2:]['response_time'].mean()
+            first_half = success_df.iloc[:len(success_df)//2]['response_time']
+            second_half = success_df.iloc[len(success_df)//2:]['response_time']
             
-            if second_half > first_half * 1.5:
+            first_mean = safe_mean(first_half)
+            second_mean = safe_mean(second_half)
+            
+            if first_mean > 0 and second_mean > first_mean * 1.5:
                 insights.append(f"{test_type}: Performance degradation detected "
-                              f"({first_half:.3f}s -> {second_half:.3f}s)")
-            elif second_half < first_half * 0.8:
+                              f"({first_mean:.3f}s -> {second_mean:.3f}s)")
+            elif first_mean > 0 and second_mean < first_mean * 0.8:
                 insights.append(f"{test_type}: Performance improvement detected "
-                              f"({first_half:.3f}s -> {second_half:.3f}s)")
+                              f"({first_mean:.3f}s -> {second_mean:.3f}s)")
         
-        # Error rate analysis
-        error_rate = (len(test_df) - len(success_df)) / len(test_df) * 100
-        if error_rate > 10:
-            insights.append(f"{test_type}: High error rate ({error_rate:.1f}%)")
-        elif error_rate == 0:
-            insights.append(f"{test_type}: No errors detected")
+        # Context-aware error analysis
+        success_count, total_count, success_rate = calculate_success_rate(test_df, test_type)
+        
+        if test_type == "Failure Injection":
+            if success_rate > 80:
+                insights.append(f"{test_type}: Excellent failure detection ({success_rate:.1f}%)")
+            elif success_rate < 50:
+                insights.append(f"{test_type}: Poor failure detection ({success_rate:.1f}%)")
+        elif test_type == "Rate Limit Test":
+            rate_limited_count = len(test_df[test_df['status_code'] == 429])
+            if rate_limited_count > 0:
+                insights.append(f"{test_type}: Rate limiting detected ({rate_limited_count} requests limited)")
+            else:
+                insights.append(f"{test_type}: No rate limiting detected - server accepted all requests")
+        else:
+            # Regular success rate analysis for other tests
+            if success_rate > 95:
+                insights.append(f"{test_type}: Excellent reliability ({success_rate:.1f}%)")
+            elif success_rate < 90:
+                insights.append(f"{test_type}: Reliability concerns ({success_rate:.1f}%)")
     
     return insights
 
@@ -818,20 +897,25 @@ def generate_enhanced_report(db_path=DB_PATH, csv_path=CSV_PATH, pdf_path=ENHANC
     graph_generated = generate_enhanced_graphs(db_path, "enhanced_graphs.png")
     summary_df = enhanced_summary_analysis(csv_path)
     
-    if not graph_generated or summary_df is None or summary_df.empty:
+    if summary_df is None or summary_df.empty:
         print("⚠️ Not enough data to generate a complete report.")
-        return
-    
-    # Load test results for analysis
-    try:
-        df_results = pd.read_csv(csv_path)
-        df_results['timestamp'] = pd.to_datetime(df_results['timestamp'])
-    except:
-        print("⚠️ Error loading test results for analysis.")
-        return
+        # Still try to create a basic report
+        try:
+            df_results = pd.read_csv(csv_path)
+        except:
+            print("❌ Cannot load test results. Skipping report generation.")
+            return
+    else:
+        # Load test results for analysis
+        try:
+            df_results = pd.read_csv(csv_path)
+            df_results['timestamp'] = pd.to_datetime(df_results['timestamp'])
+        except:
+            print("⚠️ Error loading test results for analysis.")
+            return
     
     # Generate insights
-    insights = analyze_performance_trends(df_results)
+    insights = analyze_performance_trends(df_results) if not df_results.empty else ["No test data available for analysis"]
     
     class PDF(FPDF):
         def header(self):
@@ -858,10 +942,10 @@ def generate_enhanced_report(db_path=DB_PATH, csv_path=CSV_PATH, pdf_path=ENHANC
     pdf.set_font("Helvetica", '', 10)
     
     # Get unique URLs from test results
-    tested_urls = df_results['url'].unique()
+    tested_urls = df_results['url'].unique() if not df_results.empty else ["No URLs tested"]
     for url in tested_urls:
         # Truncate very long URLs to fit on page
-        display_url = url if len(url) <= 70 else url[:67] + "..."
+        display_url = url if len(str(url)) <= 70 else str(url)[:67] + "..."
         pdf.cell(0, 6, f"- {display_url}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(3)
     
@@ -871,17 +955,18 @@ def generate_enhanced_report(db_path=DB_PATH, csv_path=CSV_PATH, pdf_path=ENHANC
     pdf.ln(5)
     
     # Overall statistics
-    total_requests = len(df_results)
-    total_successful = len(df_results[df_results['response_time'] > 0])
-    overall_success_rate = (total_successful / total_requests) * 100 if total_requests > 0 else 0
-    
-    if total_successful > 0:
-        avg_response_time = df_results[df_results['response_time'] > 0]['response_time'].mean()
-        p95_response_time = df_results[df_results['response_time'] > 0]['response_time'].quantile(0.95)
-    else:
-        avg_response_time = p95_response_time = 0
-    
-    summary_text = f"""Test Overview:
+    if not df_results.empty:
+        total_requests = len(df_results)
+        total_successful = len(df_results[df_results['response_time'] > 0])
+        overall_success_rate = (total_successful / total_requests) * 100 if total_requests > 0 else 0
+        
+        if total_successful > 0:
+            avg_response_time = safe_mean(df_results[df_results['response_time'] > 0]['response_time'])
+            p95_response_time = safe_quantile(df_results[df_results['response_time'] > 0]['response_time'], 0.95)
+        else:
+            avg_response_time = p95_response_time = 0
+        
+        summary_text = f"""Test Overview:
 - Total Requests: {total_requests:,}
 - Overall Success Rate: {overall_success_rate:.1f}%
 - Average Response Time: {avg_response_time:.3f} seconds
@@ -891,6 +976,12 @@ def generate_enhanced_report(db_path=DB_PATH, csv_path=CSV_PATH, pdf_path=ENHANC
 System Performance:
 - Baseline CPU: {baseline_metrics['cpu']:.1f}%
 - Baseline RAM: {baseline_metrics['ram']:.1f}%
+"""
+    else:
+        summary_text = """Test Overview:
+- No test data available
+- Tests may have failed to execute properly
+- Check network connectivity and target URL accessibility
 """
     
     pdf.multi_cell(0, 6, summary_text)
@@ -904,7 +995,6 @@ System Performance:
     if insights:
         for insight in insights[:8]:  # Limit to top 8 insights
             # Use multi_cell with proper width management
-            # Set width to 180 to leave margin, and wrap text properly
             try:
                 pdf.multi_cell(180, 5, f"- {insight}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             except:
@@ -942,58 +1032,64 @@ System Performance:
                         prefix = "- " if first_line else "  "
                         pdf.cell(0, 5, f"{prefix}{current_line}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     else:
-        pdf.multi_cell(180, 5, "- No significant performance issues detected", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.multi_cell(180, 5, "- No insights available due to lack of test data", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     
-    # Page 2: Visualizations
-    pdf.add_page()
-    pdf.set_font("Helvetica", 'B', 14)
-    pdf.cell(0, 10, "Performance Visualizations", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.image("enhanced_graphs.png", x=5, y=30, w=200)
+    # Page 2: Visualizations (only if graphs were generated)
+    if graph_generated:
+        pdf.add_page()
+        pdf.set_font("Helvetica", 'B', 14)
+        pdf.cell(0, 10, "Performance Visualizations", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        try:
+            pdf.image("enhanced_graphs.png", x=5, y=30, w=200)
+        except:
+            pdf.set_font("Helvetica", '', 12)
+            pdf.cell(0, 10, "Visualization generation failed - insufficient data", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     
-    # Page 3: Detailed Results
-    pdf.add_page()
-    pdf.set_font("Helvetica", 'B', 14)
-    pdf.cell(0, 10, "Detailed Test Results", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(5)
-    
-    # Results table
-    pdf.set_font("Helvetica", 'B', 9)
-    headers = ['Test Type', 'Requests', 'Success Rate', 'Avg Time', 'P95 Time', 'Throughput']
-    col_widths = [45, 20, 25, 25, 25, 25]
-    
-    # Print headers
-    for i, header in enumerate(headers):
-        if i == len(headers) - 1:
-            pdf.cell(col_widths[i], 8, header, 1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
-        else:
-            pdf.cell(col_widths[i], 8, header, 1, new_x=XPos.RIGHT, new_y=YPos.TOP, align='C')
-    
-    # Print data
-    pdf.set_font("Helvetica", '', 8)
-    for _, row in summary_df.iterrows():
-        # Determine success rate column name
-        success_col = None
-        for col in row.index:
-            if 'Rate (%)' in col or 'Detection Rate' in col:
-                success_col = col
-                break
+    # Page 3: Detailed Results (only if we have summary data)
+    if summary_df is not None and not summary_df.empty:
+        pdf.add_page()
+        pdf.set_font("Helvetica", 'B', 14)
+        pdf.cell(0, 10, "Detailed Test Results", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(5)
         
-        success_rate = row[success_col] if success_col else 0
+        # Results table
+        pdf.set_font("Helvetica", 'B', 9)
+        headers = ['Test Type', 'Requests', 'Success Rate', 'Avg Time', 'P95 Time', 'Throughput']
+        col_widths = [45, 20, 25, 25, 25, 25]
         
-        data_row = [
-            str(row['Test Type'])[:20],
-            str(int(row['Total Requests'])),
-            f"{success_rate:.1f}%",
-            f"{row['Avg Response Time (s)']:.3f}",
-            f"{row['P95 Response Time (s)']:.3f}",
-            f"{row['Throughput (req/s)']:.2f}"
-        ]
-        
-        for i, cell_data in enumerate(data_row):
-            if i == len(data_row) - 1:
-                pdf.cell(col_widths[i], 8, cell_data, 1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+        # Print headers
+        for i, header in enumerate(headers):
+            if i == len(headers) - 1:
+                pdf.cell(col_widths[i], 8, header, 1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
             else:
-                pdf.cell(col_widths[i], 8, cell_data, 1, new_x=XPos.RIGHT, new_y=YPos.TOP, align='C')
+                pdf.cell(col_widths[i], 8, header, 1, new_x=XPos.RIGHT, new_y=YPos.TOP, align='C')
+        
+        # Print data
+        pdf.set_font("Helvetica", '', 8)
+        for _, row in summary_df.iterrows():
+            # Determine success rate column name
+            success_col = None
+            for col in row.index:
+                if 'Rate (%)' in col or 'Detection Rate' in col:
+                    success_col = col
+                    break
+            
+            success_rate = row[success_col] if success_col else 0
+            
+            data_row = [
+                str(row['Test Type'])[:20],
+                str(int(row['Total Requests'])),
+                f"{success_rate:.1f}%",
+                f"{row['Avg Response Time (s)']:.3f}",
+                f"{row['P95 Response Time (s)']:.3f}",
+                f"{row['Throughput (req/s)']:.2f}"
+            ]
+            
+            for i, cell_data in enumerate(data_row):
+                if i == len(data_row) - 1:
+                    pdf.cell(col_widths[i], 8, cell_data, 1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+                else:
+                    pdf.cell(col_widths[i], 8, cell_data, 1, new_x=XPos.RIGHT, new_y=YPos.TOP, align='C')
     
     # Page 4: Analysis and Recommendations
     pdf.add_page()
@@ -1001,67 +1097,100 @@ System Performance:
     pdf.cell(0, 10, "Analysis and Recommendations", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(5)
     
-    # Performance analysis by test type
-    for test_type in df_results['test_type'].unique():
-        test_df = df_results[df_results['test_type'] == test_type]
-        success_df = test_df[test_df['response_time'] > 0]
-        
-        pdf.set_font("Helvetica", 'B', 11)
-        pdf.cell(0, 8, f"{test_type}:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        
-        pdf.set_font("Helvetica", '', 10)
-        
-        recommendations = []
-        
-        if test_type == "Load Test":
-            if not success_df.empty:
-                p95_time = success_df['response_time'].quantile(0.95)
-                if p95_time > 2.0:
-                    recommendations.append("Consider performance optimization - P95 response time exceeds 2 seconds")
-                elif p95_time < 0.5:
-                    recommendations.append("Excellent response times under load")
-        
-        elif test_type == "Rate Limit Test":
-            rate_limited = len(test_df[test_df['error_type'] == 'rate_limited'])
-            if rate_limited == 0:
-                recommendations.append("No rate limiting detected - consider implementing rate limits")
-            else:
-                recommendations.append(f"Rate limiting working correctly ({rate_limited} requests limited)")
-        
-        elif test_type == "Failure Injection":
-            success_rate = (test_df['status_code'] != 200).mean() * 100
-            if success_rate < 80:
-                recommendations.append("Improve error handling - some failures not properly detected")
-            else:
-                recommendations.append("Good error detection and handling")
-        
-        elif test_type == "Stability Test":
-            if not success_df.empty and len(success_df) > 10:
-                response_times = success_df['response_time']
-                cv = response_times.std() / response_times.mean()
-                if cv > 0.5:
-                    recommendations.append("Response time variability indicates stability issues")
+    if not df_results.empty:
+        # Performance analysis by test type
+        for test_type in df_results['test_type'].unique():
+            test_df = df_results[df_results['test_type'] == test_type]
+            success_df = test_df[test_df['response_time'] > 0]
+            
+            pdf.set_font("Helvetica", 'B', 11)
+            pdf.cell(0, 8, f"{test_type}:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            
+            pdf.set_font("Helvetica", '', 10)
+            
+            recommendations = []
+            success_count, total_count, success_rate = calculate_success_rate(test_df, test_type)
+            
+            if test_type.startswith("Load Test"):
+                if not success_df.empty:
+                    p95_time = safe_quantile(success_df['response_time'], 0.95)
+                    if p95_time > 2.0:
+                        recommendations.append("Consider performance optimization - P95 response time exceeds 2 seconds")
+                    elif p95_time < 0.5:
+                        recommendations.append("Excellent response times under load")
+                    
+                    if success_rate < 95:
+                        recommendations.append(f"Reliability concern - only {success_rate:.1f}% requests succeeded")
                 else:
-                    recommendations.append("Stable performance over extended period")
-        
-        if not recommendations:
-            recommendations.append("No specific issues identified")
-        
-        for rec in recommendations:
-            try:
-                pdf.multi_cell(0, 5, f"  - {rec}")
-            except:
-                pdf.cell(0, 5, f"  - {rec[:60]}...", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        
-        pdf.ln(3)
+                    recommendations.append("Load test failed - no successful responses recorded")
+            
+            elif test_type == "Rate Limit Test":
+                rate_limited = len(test_df[test_df['status_code'] == 429])
+                if rate_limited == 0:
+                    recommendations.append("No rate limiting detected - consider implementing rate limits for DDoS protection")
+                else:
+                    recommendations.append(f"Rate limiting working correctly ({rate_limited} requests limited)")
+            
+            elif test_type == "Failure Injection":
+                if success_rate > 80:
+                    recommendations.append(f"Excellent error handling - {success_rate:.1f}% of failures properly detected")
+                elif success_rate < 50:
+                    recommendations.append(f"Poor error handling - only {success_rate:.1f}% of failures detected")
+                else:
+                    recommendations.append(f"Adequate error handling - {success_rate:.1f}% of failures detected")
+            
+            elif test_type == "Stability Test":
+                if not success_df.empty and len(success_df) > 10:
+                    response_times = success_df['response_time']
+                    mean_time = safe_mean(response_times)
+                    if mean_time > 0:
+                        cv = response_times.std() / mean_time
+                        if cv > 0.5:
+                            recommendations.append("Response time variability indicates stability issues")
+                        else:
+                            recommendations.append("Stable performance over extended period")
+                    
+                    if success_rate < 95:
+                        recommendations.append(f"Stability concern - only {success_rate:.1f}% requests succeeded over time")
+                else:
+                    recommendations.append("Stability test failed - insufficient successful responses")
+            
+            if not recommendations:
+                recommendations.append("No specific analysis available - insufficient data")
+            
+            for rec in recommendations:
+                try:
+                    pdf.multi_cell(0, 5, f"  - {rec}")
+                except:
+                    pdf.cell(0, 5, f"  - {rec[:60]}...", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            
+            pdf.ln(3)
+    else:
+        pdf.set_font("Helvetica", '', 12)
+        pdf.multi_cell(0, 6, """No test results available for analysis.
+
+Possible causes:
+- Network connectivity issues
+- Target server not responding
+- Firewall blocking requests
+- Invalid URL format
+
+Recommendations:
+- Verify target URL is accessible in a web browser
+- Check network connection
+- Try testing with a known working URL (e.g., http://httpbin.org/get)
+- Review error logs for specific connection issues""")
     
     # Save PDF
-    pdf.output(pdf_path)
-    print(f"📊 Enhanced PDF report saved to: {pdf_path}")
+    try:
+        pdf.output(pdf_path)
+        print(f"📊 Enhanced PDF report saved to: {pdf_path}")
+    except Exception as e:
+        print(f"⚠️ Error saving PDF report: {e}")
 
 # ====== Main CLI ======
 def main():
-    print("🚀 Performance Testing Tool v2.0")
+    print("🚀 Performance Testing Tool v2.1 - Fixed Edition")
     print("=" * 50)
     
     # Initialize
@@ -1162,13 +1291,24 @@ def main():
         print(f"📁 {CSV_PATH} - Test results")
         print(f"📁 {SYSTEM_METRICS_CSV} - System metrics")
         print(f"📁 {ENHANCED_PDF_PATH} - Comprehensive report")
-        print(f"📁 {ENHANCED_SUMMARY_CSV} - Detailed summary")
-        print(f"📁 enhanced_graphs.png - Performance visualizations")
+        if os.path.exists(ENHANCED_SUMMARY_CSV):
+            print(f"📁 {ENHANCED_SUMMARY_CSV} - Detailed summary")
+        if os.path.exists("enhanced_graphs.png"):
+            print(f"📁 enhanced_graphs.png - Performance visualizations")
+        
+        print("\n📋 Quick Summary:")
+        print("- Fixed success rate calculations for all test types")
+        print("- Improved timeout handling to show actual response times")
+        print("- Enhanced failure injection test logic")
+        print("- Consistent rate limit detection and reporting")
+        print("- Better error analysis and recommendations")
         
     except KeyboardInterrupt:
         print("\n⚠️ Testing interrupted by user")
     except Exception as e:
         print(f"\n❌ Error during testing: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         monitoring_active = False
         save_system_metrics()
